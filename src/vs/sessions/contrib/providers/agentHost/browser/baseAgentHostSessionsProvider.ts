@@ -3,7 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { disposableTimeout, raceTimeout } from '../../../../../base/common/async.js';
+import { disposableTimeout, DeferredPromise, raceTimeout } from '../../../../../base/common/async.js';
 import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
 import { arrayEquals, structuralEquals } from '../../../../../base/common/equals.js';
@@ -27,13 +27,14 @@ import { migrateLegacyAutopilotConfig } from '../../../../../platform/agentHost/
 import type { IAgentSubscription } from '../../../../../platform/agentHost/common/state/agentSubscription.js';
 import { ResolveSessionConfigResult } from '../../../../../platform/agentHost/common/state/protocol/commands.js';
 import { AgentCustomization, AgentSelection, ChangesSummary, type ChangesetFile, Customization, CustomizationType, ModelSelection, SessionStatus as ProtocolSessionStatus, RootConfigState, RootState, SessionActiveClient, SessionState, SessionSummary, type Changeset } from '../../../../../platform/agentHost/common/state/protocol/state.js';
-import { ActionType, isChatAction, isSessionAction, NotificationType } from '../../../../../platform/agentHost/common/state/sessionActions.js';
+import { ActionType, isChatAction, isSessionAction, NotificationType, type SdkDownloadProgressParams } from '../../../../../platform/agentHost/common/state/sessionActions.js';
 import { AgentInfo, buildChatUri, buildDefaultChatUri, isDefaultChatUri, parseChatUri, readSessionGitState, ROOT_STATE_URI, SessionMeta, StateComponents, type ChatSummary, type ISessionGitState } from '../../../../../platform/agentHost/common/state/sessionState.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
 import { ILogService } from '../../../../../platform/log/common/log.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../../platform/storage/common/storage.js';
+import { IProgressService, IProgressStep, ProgressLocation } from '../../../../../platform/progress/common/progress.js';
 import { IWorkspaceTrustManagementService } from '../../../../../platform/workspace/common/workspaceTrust.js';
 import { IAgentHostActiveClientService } from '../../../../../workbench/contrib/chat/browser/agentSessions/agentHost/agentHostActiveClientService.js';
 import { IChatWidgetService } from '../../../../../workbench/contrib/chat/browser/chat.js';
@@ -1219,6 +1220,19 @@ class NewSession extends Disposable {
  * URI-scheme mapping for session metadata, the agent-provider lookup, and
  * the browse UI.
  */
+/**
+ * One in-flight agent-SDK download, tracked by
+ * {@link BaseAgentHostSessionsProvider._activeSdkDownloads}. Owns the lifecycle
+ * of a single notification progress: `report` pushes a step, `complete`
+ * resolves the backing deferred so the notification is dismissed.
+ */
+interface IActiveSdkDownload {
+	/** Last reported determinate percentage, used to compute progress increments. */
+	lastPercent: number;
+	report(step: IProgressStep): void;
+	complete(): void;
+}
+
 export abstract class BaseAgentHostSessionsProvider extends Disposable implements IAgentHostSessionsProvider {
 
 	abstract readonly id: string;
@@ -1269,6 +1283,15 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 
 	/** Cache of adapted sessions, keyed by raw session ID. */
 	protected readonly _sessionCache = new Map<string, AgentHostSessionAdapter>();
+
+	/**
+	 * Active agent-SDK downloads keyed by `downloadId`. Each entry owns one
+	 * long-running notification progress (opened on the first frame) that is
+	 * driven via {@link IActiveSdkDownload.report} and dismissed via
+	 * {@link IActiveSdkDownload.complete} on the terminal frame. See
+	 * {@link _handleSdkDownloadProgress}.
+	 */
+	private readonly _activeSdkDownloads = new Map<string, IActiveSdkDownload>();
 
 	/**
 	 * Temporary session that has been sent (first turn dispatched) but not yet
@@ -1373,6 +1396,7 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 		@IStorageService protected readonly _storageService: IStorageService,
 		@IDialogService protected readonly _dialogService: IDialogService,
 		@IWorkspaceTrustManagementService protected readonly _workspaceTrustManagementService: IWorkspaceTrustManagementService,
+		@IProgressService protected readonly _progressService: IProgressService,
 	) {
 		super();
 		this._register(toDisposable(() => {
@@ -1380,6 +1404,12 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 				cached.dispose();
 			}
 			this._sessionCache.clear();
+		}));
+		this._register(toDisposable(() => {
+			for (const download of this._activeSdkDownloads.values()) {
+				download.complete();
+			}
+			this._activeSdkDownloads.clear();
 		}));
 	}
 
@@ -2934,6 +2964,8 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 				this._handleSessionRemoved(n.session);
 			} else if (n.type === NotificationType.SessionSummaryChanged) {
 				this._handleSessionSummaryChanged(n.session, n.changes);
+			} else if (n.type === NotificationType.SdkDownloadProgress) {
+				this._handleSdkDownloadProgress(n);
 			}
 		}));
 
@@ -3094,6 +3126,68 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 				this._onDidChangeSessions.fire({ added: [], removed: [], changed: [cached] });
 			}
 		});
+	}
+
+	/**
+	 * Render a host-level agent-SDK download as a notification progress. The
+	 * download happens in the agent host (a provider's native SDK is fetched
+	 * once on first use and shared across sessions), and the host broadcasts
+	 * its progress as a `root/sdkDownloadProgress` notification. We surface a
+	 * single notification per `downloadId`: determinate when the host knows the
+	 * total (`Content-Length`), or a byte-count spinner otherwise.
+	 */
+	private _handleSdkDownloadProgress(progress: SdkDownloadProgressParams): void {
+		// New AI UI must stay hidden when the user has turned AI features off.
+		if (this._baseConfigurationService.getValue<boolean>(ChatConfiguration.AIDisabled)) {
+			return;
+		}
+
+		if (progress.phase === 'completed' || progress.phase === 'failed') {
+			this._activeSdkDownloads.get(progress.downloadId)?.complete();
+			this._activeSdkDownloads.delete(progress.downloadId);
+			return;
+		}
+
+		let entry = this._activeSdkDownloads.get(progress.downloadId);
+		if (!entry) {
+			// First frame for this download (`started`, or a `progress` we
+			// joined late): open one long-running notification progress and
+			// drive it via `report` until a terminal frame resolves `deferred`.
+			const deferred = new DeferredPromise<void>();
+			let report: ((step: IProgressStep) => void) | undefined;
+			this._progressService.withProgress(
+				{
+					location: ProgressLocation.Notification,
+					title: localize('agentHost.sdkDownload.title', "Downloading {0} agent…", progress.displayName),
+				},
+				p => {
+					report = step => p.report(step);
+					return deferred.p;
+				},
+			);
+			entry = {
+				lastPercent: 0,
+				report: step => report?.(step),
+				complete: () => deferred.complete(),
+			};
+			this._activeSdkDownloads.set(progress.downloadId, entry);
+		}
+
+		if (progress.totalBytes && progress.totalBytes > 0) {
+			const percent = Math.max(0, Math.min(100, Math.round((progress.receivedBytes / progress.totalBytes) * 100)));
+			const increment = percent - entry.lastPercent;
+			entry.lastPercent = percent;
+			entry.report({
+				message: localize('agentHost.sdkDownload.percent', "{0}%", percent),
+				increment: increment > 0 ? increment : 0,
+				total: 100,
+			});
+		} else {
+			// No `Content-Length`: indeterminate. Show megabytes received so
+			// the user still sees the download making progress.
+			const megabytes = (progress.receivedBytes / (1024 * 1024)).toFixed(1);
+			entry.report({ message: localize('agentHost.sdkDownload.megabytes', "{0} MB", megabytes) });
+		}
 	}
 
 	private _handleConfigChanged(session: string, config: Record<string, unknown>, replace: boolean): void {

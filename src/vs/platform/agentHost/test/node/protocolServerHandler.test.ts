@@ -23,6 +23,7 @@ import { ProtocolServerHandler } from '../../node/protocolServerHandler.js';
 import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { AgentHostFileSystemProvider, agentHostUri } from '../../common/agentHostFileSystemProvider.js';
 import { iterateOtlpLogRecords, OtlpLogEmitter } from '../../common/otlp/otlpLogEmitter.js';
+import type { IAgentSdkDownloadProgress } from '../../node/agentSdkDownloader.js';
 
 // ---- Mock helpers -----------------------------------------------------------
 
@@ -1819,6 +1820,71 @@ suite('ProtocolServerHandler', () => {
 			otlpEmitter.emit({ timeUnixNano: '2', severityNumber: 9, severityText: 'info', body: 'after-unsub' });
 
 			assert.strictEqual(findOtlpLogs(transport.sent).length, 1, 'no further notifications after unsubscribe');
+		});
+	});
+
+	suite('SDK download progress channel', () => {
+		// Agent-SDK download progress is emitted on the state manager (so it
+		// reaches both local IPC and remote WebSocket renderers through the same
+		// path as session notifications). This suite verifies the handler
+		// forwards each frame to connected clients as a `root/sdkDownloadProgress`
+		// notification on the root channel. Spun up per-test with a private
+		// state manager so the outer suite is unaffected.
+		let sdkStateManager: AgentHostStateManager;
+		let sdkServer: MockProtocolServer;
+		let sdkAgentService: MockAgentService;
+		let localDisposables: DisposableStore;
+
+		setup(() => {
+			localDisposables = new DisposableStore();
+			sdkStateManager = localDisposables.add(new AgentHostStateManager(new NullLogService()));
+			sdkServer = localDisposables.add(new MockProtocolServer());
+			sdkAgentService = new MockAgentService();
+			sdkAgentService.setStateManager(sdkStateManager);
+			localDisposables.add(sdkAgentService);
+			localDisposables.add(new ProtocolServerHandler(
+				sdkAgentService,
+				sdkStateManager,
+				sdkServer,
+				{ defaultDirectory: URI.file('/home/testuser').toString() },
+				localDisposables.add(new AgentHostFileSystemProvider()),
+				new NullLogService(),
+			));
+		});
+
+		teardown(() => {
+			localDisposables.dispose();
+		});
+
+		function connectSdkClient(clientId: string): MockProtocolTransport {
+			const transport = new MockProtocolTransport();
+			sdkServer.simulateConnection(transport);
+			transport.simulateMessage(request(1, 'initialize', {
+				protocolVersions: [PROTOCOL_VERSION],
+				clientId,
+			}));
+			return transport;
+		}
+
+		function findSdkProgress(sent: ProtocolMessage[]): (IAgentSdkDownloadProgress & { channel: string })[] {
+			return sent
+				.filter(isJsonRpcNotification)
+				.filter((m): m is AhpNotification & { method: 'root/sdkDownloadProgress'; params: IAgentSdkDownloadProgress & { channel: string } } => m.method === 'root/sdkDownloadProgress')
+				.map(m => m.params);
+		}
+
+		test('forwards each download-progress frame to connected clients on the root channel', () => {
+			const transport = connectSdkClient('client-sdk-1');
+
+			sdkStateManager.emitSdkDownloadProgress({ downloadId: 'd1', packageId: 'claude', displayName: 'Claude', phase: 'started', receivedBytes: 0, totalBytes: 1000 });
+			sdkStateManager.emitSdkDownloadProgress({ downloadId: 'd1', packageId: 'claude', displayName: 'Claude', phase: 'progress', receivedBytes: 500, totalBytes: 1000 });
+			sdkStateManager.emitSdkDownloadProgress({ downloadId: 'd1', packageId: 'claude', displayName: 'Claude', phase: 'completed', receivedBytes: 1000, totalBytes: 1000 });
+
+			const frames = findSdkProgress(transport.sent);
+			assert.deepStrictEqual(frames.map(f => f.phase), ['started', 'progress', 'completed']);
+			assert.deepStrictEqual(frames.map(f => f.receivedBytes), [0, 500, 1000]);
+			assert.ok(frames.every(f => f.downloadId === 'd1' && f.displayName === 'Claude' && f.totalBytes === 1000));
+			assert.ok(frames.every(f => f.channel === 'ahp-root://'), 'frames are broadcast on the root channel');
 		});
 	});
 

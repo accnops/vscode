@@ -143,3 +143,97 @@ export interface SessionSummaryChangedParams {
 	 */
 	changes: Partial<SessionSummary>;
 }
+
+// ─── root/sdkDownloadProgress ────────────────────────────────────────────────
+
+/**
+ * Lifecycle phase of a single agent-SDK download.
+ *
+ * @category Protocol Notifications
+ */
+export type SdkDownloadPhase = 'started' | 'progress' | 'completed' | 'failed';
+
+/**
+ * Broadcast on the root channel while the host downloads an agent's native
+ * SDK/runtime — a multi-MB artifact some hosts fetch lazily the first time a
+ * provider is used. Lets clients show a progress indicator instead of a silent
+ * multi-second hang.
+ *
+ * This is **host-level**, not session state: the artifact is shared across
+ * every session of that provider and the host deduplicates concurrent fetches
+ * into one download (one `downloadId`). The optional `session` field names the
+ * session whose action triggered the fetch, purely as context — a client MAY
+ * attribute the progress to that session's row, or show a single global
+ * indicator and ignore it.
+ *
+ * Semantics:
+ *
+ * - Frames for one download share a stable `downloadId`. The first frame a
+ *   client observes for a `downloadId` begins the indicator even if it is not
+ *   `phase: 'started'` (a client that connects mid-download may miss the
+ *   `started` frame).
+ * - `receivedBytes` is monotonically non-decreasing within a `downloadId`.
+ *   `totalBytes` is present only when the host knows the size up front
+ *   (e.g. a `Content-Length`); when absent the client SHOULD show an
+ *   indeterminate indicator.
+ * - Exactly one terminal frame (`phase: 'completed'` or `'failed'`) ends a
+ *   download. `error` carries a short, non-localized reason on failure.
+ * - Like all notifications this is ephemeral and is **not** replayed on
+ *   reconnect. A client that never receives a terminal frame (the download
+ *   finished while it was disconnected) SHOULD expire the indicator after an
+ *   idle timeout.
+ * - The brand noun is carried in `displayName`; clients own the surrounding
+ *   (localized) template, e.g. `"Downloading {displayName} agent… {pct}%"`.
+ *
+ * @category Protocol Notifications
+ * @method root/sdkDownloadProgress
+ * @direction Server → Client
+ * @messageType Notification
+ * @version 1
+ * @example
+ * ```json
+ * {
+ *   "jsonrpc": "2.0",
+ *   "method": "root/sdkDownloadProgress",
+ *   "params": {
+ *     "channel": "ahp-root://",
+ *     "downloadId": "d3f1c2",
+ *     "packageId": "claude",
+ *     "displayName": "Claude",
+ *     "phase": "progress",
+ *     "receivedBytes": 18874368,
+ *     "totalBytes": 41957498,
+ *     "session": "ahp-session:/<uuid>"
+ *   }
+ * }
+ * ```
+ */
+export interface SdkDownloadProgressParams {
+	/** Channel URI this notification belongs to (the root channel) */
+	channel: URI;
+	/**
+	 * Stable id for one download. Coalesces the frames of a single fetch and
+	 * distinguishes concurrent downloads (e.g. two providers at once).
+	 */
+	downloadId: string;
+	/** Provider/package id being downloaded, e.g. `'claude'` or `'codex'`. */
+	packageId: string;
+	/**
+	 * Human-readable brand name for display, e.g. `'Claude'`. The host supplies
+	 * the noun; the client owns the surrounding localized template.
+	 */
+	displayName: string;
+	/** Lifecycle phase of this frame. */
+	phase: SdkDownloadPhase;
+	/** Bytes written so far. Monotonically non-decreasing within a `downloadId`. */
+	receivedBytes: number;
+	/** Total bytes when known (e.g. from `Content-Length`); omitted ⇒ indeterminate. */
+	totalBytes?: number;
+	/**
+	 * Session whose action triggered the fetch, if any. Informational only —
+	 * the download is host-level and shared across sessions.
+	 */
+	session?: URI;
+	/** Short, non-localized failure reason; present only when `phase: 'failed'`. */
+	error?: string;
+}

@@ -440,6 +440,7 @@ interface IConnectionReady {
  */
 export const CodexSdkPackage: IAgentSdkPackage = {
 	id: 'codex',
+	displayName: 'Codex',
 	devOverrideEnvVar: AgentHostCodexAgentSdkRootEnvVar,
 	hasSeparateMuslLinuxPackage: false,
 };
@@ -2172,6 +2173,15 @@ export class CodexAgent extends Disposable implements IAgent {
 
 	async listSessions(): Promise<IAgentSessionMetadata[]> {
 		if (!this._githubToken) {
+			return [];
+		}
+		// Don't connect (and trigger a cold SDK download) just to list threads
+		// at startup. When the SDK isn't local yet, surface an empty list; the
+		// download fires (with host-level progress) once the user starts a
+		// session, and the next `listSessions` — driven by the renderer's
+		// post-turn refresh — returns the full list.
+		if (!(await this._agentSdkDownloader.isSdkResolvableWithoutDownload(CodexSdkPackage))) {
+			this._logService.info('[Codex] SDK not downloaded yet; deferring thread/list until a session triggers the download');
 			return [];
 		}
 		try {

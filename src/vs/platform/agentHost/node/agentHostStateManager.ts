@@ -9,7 +9,7 @@ import { Disposable } from '../../../base/common/lifecycle.js';
 import { equals } from '../../../base/common/objects.js';
 import { ILogService } from '../../log/common/log.js';
 import { TelemetryLevel } from '../../telemetry/common/telemetry.js';
-import { ActionType, ActionEnvelope, ActionOrigin, INotification, IRootConfigChangedAction, SessionAction, ChatAction, RootAction, StateAction, TerminalAction, ChangesetAction, AnnotationsAction, ClientAnnotationsAction, isRootAction, isSessionAction, isChatAction, isChangesetAction, isAnnotationsAction } from '../common/state/sessionActions.js';
+import { ActionType, ActionEnvelope, ActionOrigin, INotification, IRootConfigChangedAction, SessionAction, ChatAction, RootAction, StateAction, TerminalAction, ChangesetAction, AnnotationsAction, ClientAnnotationsAction, isRootAction, isSessionAction, isChatAction, isChangesetAction, isAnnotationsAction, type SdkDownloadProgressParams } from '../common/state/sessionActions.js';
 import type { IStateSnapshot } from '../common/state/sessionProtocol.js';
 import { rootReducer, sessionReducer, chatReducer, changesetReducer, annotationsReducer } from '../common/state/sessionReducers.js';
 import { createRootState, createSessionState, createChatState, createDefaultChatSummary, chatSummaryFromState, buildDefaultChatUri, parseDefaultChatUri, isAhpChatChannel, isDefaultChatUri, mergeSessionWithDefaultChat, isAhpRootChannel, SessionLifecycle, withHostBuildInfo, type Changeset, type ChangesetState, type AnnotationsState, type ChatState, type ChatSummary, type Customization, type ISessionWithDefaultChat, type RootState, type SessionConfigState, type SessionMeta, type SessionState, type SessionSummary, type Turn, type URI, ROOT_STATE_URI, ChangesetStatus, IHostBuildInfo, SessionStatus } from '../common/state/sessionState.js';
@@ -1119,5 +1119,22 @@ export class AgentHostStateManager extends Disposable {
 				changes,
 			});
 		}
+	}
+
+	/**
+	 * Emit a host-level agent-SDK download-progress notification on the root
+	 * channel. Routed to clients through the same {@link onDidEmitNotification}
+	 * path as session notifications, so both the local (IPC proxy) and remote
+	 * (WebSocket {@link ProtocolServerHandler}) renderers receive it without any
+	 * transport-specific special casing. The download is host-level (a
+	 * provider's native SDK is fetched once and shared across sessions), hence
+	 * the root channel rather than a per-session one.
+	 */
+	emitSdkDownloadProgress(progress: Omit<SdkDownloadProgressParams, 'channel'>): void {
+		this._onDidEmitNotification.fire({
+			type: 'root/sdkDownloadProgress',
+			channel: ROOT_STATE_URI,
+			...progress,
+		});
 	}
 }

@@ -333,6 +333,10 @@ class ProxyRoundTripSdkService implements IClaudeAgentSdkService {
 		return [];
 	}
 
+	async canLoadWithoutDownload(): Promise<boolean> {
+		return true;
+	}
+
 	async getSessionInfo(_sessionId: string): Promise<SDKSessionInfo | undefined> {
 		return undefined;
 	}

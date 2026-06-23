@@ -1058,6 +1058,7 @@ export class RemoteAgentHostProtocolClient extends Disposable implements IAgentC
 				case 'root/sessionAdded':
 				case 'root/sessionRemoved':
 				case 'root/sessionSummaryChanged':
+				case 'root/sdkDownloadProgress':
 				case 'auth/required': {
 					this._logService.trace(`[RemoteAgentHostProtocol] Notification: ${msg.method}`);
 					// The case narrows `msg.method` to a single literal; the matching params
