@@ -1698,7 +1698,16 @@ export class CodexAgent extends Disposable implements IAgent {
 		if (!session.workingDirectory) {
 			return;
 		}
-		void this._materializeIfNeeded(session, false).then(() => {
+		void (async () => {
+			// Prewarm is a background latency optimization, not a user action,
+			// so it must NOT trigger a cold SDK download. When the SDK isn't
+			// local yet, skip prewarm; the first `sendMessage` materializes the
+			// thread and fires the (host-level progress-reported) download then.
+			if (!(await this._agentSdkDownloader.isSdkResolvableWithoutDownload(CodexSdkPackage))) {
+				this._logService.info(`[Codex] SDK not downloaded yet; skipping prewarm for session=${session.sessionUri.toString()} until a message triggers the download`);
+				return;
+			}
+			await this._materializeIfNeeded(session, false);
 			if (session.prewarmClaimed || session.threadId === undefined) {
 				return;
 			}
@@ -1707,7 +1716,7 @@ export class CodexAgent extends Disposable implements IAgent {
 				void this._expirePrewarm(session);
 			}, CodexPrewarmTtlMs);
 			session.prewarmTimer = prewarmTimer;
-		}).catch(err => {
+		})().catch(err => {
 			this._logService.warn(`[Codex] prewarm failed session=${session.sessionUri.toString()}: ${err instanceof Error ? err.message : String(err)}`);
 		});
 	}
