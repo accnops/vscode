@@ -120,7 +120,7 @@ export function resolveSdkTarget(
 
 export const IAgentSdkDownloader = createDecorator<IAgentSdkDownloader>('agentSdkDownloader');
 
-/** Lifecycle phase of a single SDK download. Mirrors the AHP `SdkDownloadPhase`. */
+/** Lifecycle phase of a single SDK download. Mirrors the AHP `DownloadPhase`. */
 export type AgentSdkDownloadPhase = 'started' | 'progress' | 'completed' | 'failed';
 
 /**

@@ -28,7 +28,8 @@ import { ClaudeAgentSdkService, ClaudeSdkPackage, IClaudeAgentSdkService } from 
 import { ClaudeProxyService, IClaudeProxyService } from './claude/claudeProxyService.js';
 import { CodexAgent, CodexSdkPackage } from './codex/codexAgent.js';
 import { CodexProxyService, ICodexProxyService } from './codex/codexProxyService.js';
-import { AgentSdkDownloader, IAgentSdkDownloader, type IAgentSdkDownloadProgress } from './agentSdkDownloader.js';
+import { AgentSdkDownloader, IAgentSdkDownloader, type IAgentSdkDownloadProgress, type AgentSdkDownloadPhase } from './agentSdkDownloader.js';
+import { DownloadPhase } from '../common/state/sessionActions.js';
 import { IAgentHostOTelService } from '../common/otel/agentHostOTelService.js';
 import { AgentHostOTelService } from './otel/agentHostOTelService.js';
 import { ProtocolServerHandler } from './protocolServerHandler.js';
@@ -215,9 +216,25 @@ async function startAgentHost(): Promise<void> {
 
 	// Surface agent-SDK download progress to clients. Routed through the state
 	// manager so it reaches both the local (IPC) and any external (WebSocket)
-	// renderer via the same notification path as session updates.
+	// renderer via the same notification path as session updates. The SDK
+	// downloader is the only producer today; map its event onto the generic
+	// `root/downloadProgress` shape with `kind: 'agent-sdk'`.
 	if (sdkDownloadProgress) {
-		disposables.add(sdkDownloadProgress(progress => agentService.stateManager.emitSdkDownloadProgress(progress)));
+		disposables.add(sdkDownloadProgress(p => agentService.stateManager.emitDownloadProgress({
+			downloadId: p.downloadId,
+			kind: 'agent-sdk',
+			resourceId: p.packageId,
+			displayName: p.displayName,
+			phase: ({
+				started: DownloadPhase.Started,
+				progress: DownloadPhase.Progress,
+				completed: DownloadPhase.Completed,
+				failed: DownloadPhase.Failed,
+			} satisfies Record<AgentSdkDownloadPhase, DownloadPhase>)[p.phase],
+			receivedBytes: p.receivedBytes,
+			totalBytes: p.totalBytes,
+			error: p.error,
+		})));
 	}
 
 	const agentChannel = ProxyChannel.fromService(agentService, disposables);

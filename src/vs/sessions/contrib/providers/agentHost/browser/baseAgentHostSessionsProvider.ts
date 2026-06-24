@@ -27,7 +27,7 @@ import { migrateLegacyAutopilotConfig } from '../../../../../platform/agentHost/
 import type { IAgentSubscription } from '../../../../../platform/agentHost/common/state/agentSubscription.js';
 import { ResolveSessionConfigResult } from '../../../../../platform/agentHost/common/state/protocol/commands.js';
 import { AgentCustomization, AgentSelection, ChangesSummary, type ChangesetFile, Customization, CustomizationType, ModelSelection, SessionStatus as ProtocolSessionStatus, RootConfigState, RootState, SessionActiveClient, SessionState, SessionSummary, type Changeset } from '../../../../../platform/agentHost/common/state/protocol/state.js';
-import { ActionType, isChatAction, isSessionAction, NotificationType, type SdkDownloadProgressParams } from '../../../../../platform/agentHost/common/state/sessionActions.js';
+import { ActionType, isChatAction, isSessionAction, NotificationType, DownloadPhase, type DownloadProgressParams } from '../../../../../platform/agentHost/common/state/sessionActions.js';
 import { AgentInfo, buildChatUri, buildDefaultChatUri, isDefaultChatUri, parseChatUri, readSessionGitState, ROOT_STATE_URI, SessionMeta, StateComponents, type ChatSummary, type ISessionGitState } from '../../../../../platform/agentHost/common/state/sessionState.js';
 import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
@@ -1221,12 +1221,12 @@ class NewSession extends Disposable {
  * the browse UI.
  */
 /**
- * One in-flight agent-SDK download, tracked by
- * {@link BaseAgentHostSessionsProvider._activeSdkDownloads}. Owns the lifecycle
+ * One in-flight download, tracked by
+ * {@link BaseAgentHostSessionsProvider._activeDownloads}. Owns the lifecycle
  * of a single notification progress: `report` pushes a step, `complete`
  * resolves the backing deferred so the notification is dismissed.
  */
-interface IActiveSdkDownload {
+interface IActiveDownload {
 	/** Last reported determinate percentage, used to compute progress increments. */
 	lastPercent: number;
 	report(step: IProgressStep): void;
@@ -1285,13 +1285,13 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 	protected readonly _sessionCache = new Map<string, AgentHostSessionAdapter>();
 
 	/**
-	 * Active agent-SDK downloads keyed by `downloadId`. Each entry owns one
-	 * long-running notification progress (opened on the first frame) that is
-	 * driven via {@link IActiveSdkDownload.report} and dismissed via
-	 * {@link IActiveSdkDownload.complete} on the terminal frame. See
-	 * {@link _handleSdkDownloadProgress}.
+	 * Active downloads keyed by `downloadId`. Each entry owns one long-running
+	 * notification progress (opened on the first frame) that is driven via
+	 * {@link IActiveDownload.report} and dismissed via
+	 * {@link IActiveDownload.complete} on the terminal frame. See
+	 * {@link _handleDownloadProgress}.
 	 */
-	private readonly _activeSdkDownloads = new Map<string, IActiveSdkDownload>();
+	private readonly _activeDownloads = new Map<string, IActiveDownload>();
 
 	/**
 	 * Temporary session that has been sent (first turn dispatched) but not yet
@@ -1406,10 +1406,10 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 			this._sessionCache.clear();
 		}));
 		this._register(toDisposable(() => {
-			for (const download of this._activeSdkDownloads.values()) {
+			for (const download of this._activeDownloads.values()) {
 				download.complete();
 			}
-			this._activeSdkDownloads.clear();
+			this._activeDownloads.clear();
 		}));
 	}
 
@@ -2964,8 +2964,8 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 				this._handleSessionRemoved(n.session);
 			} else if (n.type === NotificationType.SessionSummaryChanged) {
 				this._handleSessionSummaryChanged(n.session, n.changes);
-			} else if (n.type === NotificationType.SdkDownloadProgress) {
-				this._handleSdkDownloadProgress(n);
+			} else if (n.type === NotificationType.DownloadProgress) {
+				this._handleDownloadProgress(n);
 			}
 		}));
 
@@ -3129,36 +3129,42 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 	}
 
 	/**
-	 * Render a host-level agent-SDK download as a notification progress. The
-	 * download happens in the agent host (a provider's native SDK is fetched
-	 * once on first use and shared across sessions), and the host broadcasts
-	 * its progress as a `root/sdkDownloadProgress` notification. We surface a
-	 * single notification per `downloadId`: determinate when the host knows the
-	 * total (`Content-Length`), or a byte-count spinner otherwise.
+	 * Render a host-level download as a notification progress. The download
+	 * happens in the agent host (e.g. a provider's native SDK, fetched once on
+	 * first use and shared across sessions) and is broadcast as a generic
+	 * `root/downloadProgress` notification. We surface a single notification per
+	 * `downloadId`: determinate when the host knows the total (`Content-Length`),
+	 * or a byte-count spinner otherwise. The `kind` discriminant lets us pick a
+	 * resource-appropriate label.
 	 */
-	private _handleSdkDownloadProgress(progress: SdkDownloadProgressParams): void {
+	private _handleDownloadProgress(progress: DownloadProgressParams): void {
 		// New AI UI must stay hidden when the user has turned AI features off.
 		if (this._baseConfigurationService.getValue<boolean>(ChatConfiguration.AIDisabled)) {
 			return;
 		}
 
-		if (progress.phase === 'completed' || progress.phase === 'failed') {
-			this._activeSdkDownloads.get(progress.downloadId)?.complete();
-			this._activeSdkDownloads.delete(progress.downloadId);
+		if (progress.phase === DownloadPhase.Completed || progress.phase === DownloadPhase.Failed) {
+			this._activeDownloads.get(progress.downloadId)?.complete();
+			this._activeDownloads.delete(progress.downloadId);
 			return;
 		}
 
-		let entry = this._activeSdkDownloads.get(progress.downloadId);
+		let entry = this._activeDownloads.get(progress.downloadId);
 		if (!entry) {
 			// First frame for this download (`started`, or a `progress` we
 			// joined late): open one long-running notification progress and
 			// drive it via `report` until a terminal frame resolves `deferred`.
 			const deferred = new DeferredPromise<void>();
 			let report: ((step: IProgressStep) => void) | undefined;
+			// An agent SDK reads naturally as "Downloading Claude agent…";
+			// other resource kinds use a neutral "Downloading {name}…".
+			const title = progress.kind === 'agent-sdk'
+				? localize('agentHost.download.agentSdkTitle', "Downloading {0} agent…", progress.displayName)
+				: localize('agentHost.download.title', "Downloading {0}…", progress.displayName);
 			this._progressService.withProgress(
 				{
 					location: ProgressLocation.Notification,
-					title: localize('agentHost.sdkDownload.title', "Downloading {0} agent…", progress.displayName),
+					title,
 				},
 				p => {
 					report = step => p.report(step);
@@ -3170,7 +3176,7 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 				report: step => report?.(step),
 				complete: () => deferred.complete(),
 			};
-			this._activeSdkDownloads.set(progress.downloadId, entry);
+			this._activeDownloads.set(progress.downloadId, entry);
 		}
 
 		if (progress.totalBytes && progress.totalBytes > 0) {
@@ -3178,7 +3184,7 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 			const increment = percent - entry.lastPercent;
 			entry.lastPercent = percent;
 			entry.report({
-				message: localize('agentHost.sdkDownload.percent', "{0}%", percent),
+				message: localize('agentHost.download.percent', "{0}%", percent),
 				increment: increment > 0 ? increment : 0,
 				total: 100,
 			});
@@ -3186,7 +3192,7 @@ export abstract class BaseAgentHostSessionsProvider extends Disposable implement
 			// No `Content-Length`: indeterminate. Show megabytes received so
 			// the user still sees the download making progress.
 			const megabytes = (progress.receivedBytes / (1024 * 1024)).toFixed(1);
-			entry.report({ message: localize('agentHost.sdkDownload.megabytes', "{0} MB", megabytes) });
+			entry.report({ message: localize('agentHost.download.megabytes', "{0} MB", megabytes) });
 		}
 	}
 

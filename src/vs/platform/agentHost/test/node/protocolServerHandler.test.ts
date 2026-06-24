@@ -13,7 +13,7 @@ import { NullLogService } from '../../../log/common/log.js';
 import { FileType } from '../../../files/common/files.js';
 import { type IAgentCreateSessionConfig, type IAgentResolveSessionConfigParams, type IAgentService, type IAgentSessionConfigCompletionsParams, type IAgentSessionMetadata, type AuthenticateParams, type AuthenticateResult } from '../../common/agentService.js';
 import { CompletionsParams, CompletionsResult, ContentEncoding, ListSessionsResult, ResourceReadResult, ResolveSessionConfigResult, SessionConfigCompletionsResult, ResourceMkdirParams, ResourceMkdirResult, ResourceResolveParams, ResourceResolveResult, ResourceCopyParams, ResourceCopyResult } from '../../common/state/protocol/commands.js';
-import { ActionType, type IRootConfigChangedAction, type SessionAction, type TerminalAction, type ClientAnnotationsAction } from '../../common/state/sessionActions.js';
+import { ActionType, type IRootConfigChangedAction, type SessionAction, type TerminalAction, type ClientAnnotationsAction, type DownloadProgressParams, DownloadPhase } from '../../common/state/sessionActions.js';
 import { PROTOCOL_VERSION } from '../../common/state/protocol/version/registry.js';
 import { isJsonRpcNotification, isJsonRpcRequest, isJsonRpcResponse, JSON_RPC_INTERNAL_ERROR, ProtocolError, AhpErrorCodes, AHP_UNSUPPORTED_PROTOCOL_VERSION, AHP_SESSION_NOT_FOUND, type AhpNotification, type InitializeResult, type ProtocolMessage, type ReconnectResult, type ResourceListResult, type ResourceWriteParams, type ResourceWriteResult, type IStateSnapshot } from '../../common/state/sessionProtocol.js';
 import { MessageKind, ResponsePartKind, SessionStatus, ChangesetStatus, ToolCallConfirmationReason, ToolCallContributorKind, ToolCallStatus, ToolResultContentType, buildChatUri, buildDefaultChatUri, type SessionSummary } from '../../common/state/sessionState.js';
@@ -23,7 +23,6 @@ import { ProtocolServerHandler } from '../../node/protocolServerHandler.js';
 import { AgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { AgentHostFileSystemProvider, agentHostUri } from '../../common/agentHostFileSystemProvider.js';
 import { iterateOtlpLogRecords, OtlpLogEmitter } from '../../common/otlp/otlpLogEmitter.js';
-import type { IAgentSdkDownloadProgress } from '../../node/agentSdkDownloader.js';
 
 // ---- Mock helpers -----------------------------------------------------------
 
@@ -1823,29 +1822,29 @@ suite('ProtocolServerHandler', () => {
 		});
 	});
 
-	suite('SDK download progress channel', () => {
-		// Agent-SDK download progress is emitted on the state manager (so it
-		// reaches both local IPC and remote WebSocket renderers through the same
-		// path as session notifications). This suite verifies the handler
-		// forwards each frame to connected clients as a `root/sdkDownloadProgress`
-		// notification on the root channel. Spun up per-test with a private
-		// state manager so the outer suite is unaffected.
-		let sdkStateManager: AgentHostStateManager;
-		let sdkServer: MockProtocolServer;
-		let sdkAgentService: MockAgentService;
+	suite('download progress channel', () => {
+		// Download progress is emitted on the state manager (so it reaches both
+		// local IPC and remote WebSocket renderers through the same path as
+		// session notifications). This suite verifies the handler forwards each
+		// frame to connected clients as a `root/downloadProgress` notification on
+		// the root channel. Spun up per-test with a private state manager so the
+		// outer suite is unaffected.
+		let dlStateManager: AgentHostStateManager;
+		let dlServer: MockProtocolServer;
+		let dlAgentService: MockAgentService;
 		let localDisposables: DisposableStore;
 
 		setup(() => {
 			localDisposables = new DisposableStore();
-			sdkStateManager = localDisposables.add(new AgentHostStateManager(new NullLogService()));
-			sdkServer = localDisposables.add(new MockProtocolServer());
-			sdkAgentService = new MockAgentService();
-			sdkAgentService.setStateManager(sdkStateManager);
-			localDisposables.add(sdkAgentService);
+			dlStateManager = localDisposables.add(new AgentHostStateManager(new NullLogService()));
+			dlServer = localDisposables.add(new MockProtocolServer());
+			dlAgentService = new MockAgentService();
+			dlAgentService.setStateManager(dlStateManager);
+			localDisposables.add(dlAgentService);
 			localDisposables.add(new ProtocolServerHandler(
-				sdkAgentService,
-				sdkStateManager,
-				sdkServer,
+				dlAgentService,
+				dlStateManager,
+				dlServer,
 				{ defaultDirectory: URI.file('/home/testuser').toString() },
 				localDisposables.add(new AgentHostFileSystemProvider()),
 				new NullLogService(),
@@ -1856,9 +1855,9 @@ suite('ProtocolServerHandler', () => {
 			localDisposables.dispose();
 		});
 
-		function connectSdkClient(clientId: string): MockProtocolTransport {
+		function connectDownloadClient(clientId: string): MockProtocolTransport {
 			const transport = new MockProtocolTransport();
-			sdkServer.simulateConnection(transport);
+			dlServer.simulateConnection(transport);
 			transport.simulateMessage(request(1, 'initialize', {
 				protocolVersions: [PROTOCOL_VERSION],
 				clientId,
@@ -1866,25 +1865,25 @@ suite('ProtocolServerHandler', () => {
 			return transport;
 		}
 
-		function findSdkProgress(sent: ProtocolMessage[]): (IAgentSdkDownloadProgress & { channel: string })[] {
+		function findDownloadProgress(sent: ProtocolMessage[]): DownloadProgressParams[] {
 			return sent
 				.filter(isJsonRpcNotification)
-				.filter((m): m is AhpNotification & { method: 'root/sdkDownloadProgress'; params: IAgentSdkDownloadProgress & { channel: string } } => m.method === 'root/sdkDownloadProgress')
+				.filter((m): m is AhpNotification & { method: 'root/downloadProgress'; params: DownloadProgressParams } => m.method === 'root/downloadProgress')
 				.map(m => m.params);
 		}
 
 		test('forwards each download-progress frame to connected clients on the root channel', () => {
-			const transport = connectSdkClient('client-sdk-1');
+			const transport = connectDownloadClient('client-dl-1');
 
-			sdkStateManager.emitSdkDownloadProgress({ downloadId: 'd1', packageId: 'claude', displayName: 'Claude', phase: 'started', receivedBytes: 0, totalBytes: 1000 });
-			sdkStateManager.emitSdkDownloadProgress({ downloadId: 'd1', packageId: 'claude', displayName: 'Claude', phase: 'progress', receivedBytes: 500, totalBytes: 1000 });
-			sdkStateManager.emitSdkDownloadProgress({ downloadId: 'd1', packageId: 'claude', displayName: 'Claude', phase: 'completed', receivedBytes: 1000, totalBytes: 1000 });
+			dlStateManager.emitDownloadProgress({ downloadId: 'd1', kind: 'agent-sdk', resourceId: 'claude', displayName: 'Claude', phase: DownloadPhase.Started, receivedBytes: 0, totalBytes: 1000 });
+			dlStateManager.emitDownloadProgress({ downloadId: 'd1', kind: 'agent-sdk', resourceId: 'claude', displayName: 'Claude', phase: DownloadPhase.Progress, receivedBytes: 500, totalBytes: 1000 });
+			dlStateManager.emitDownloadProgress({ downloadId: 'd1', kind: 'agent-sdk', resourceId: 'claude', displayName: 'Claude', phase: DownloadPhase.Completed, receivedBytes: 1000, totalBytes: 1000 });
 
-			const frames = findSdkProgress(transport.sent);
-			assert.deepStrictEqual(frames.map(f => f.phase), ['started', 'progress', 'completed']);
+			const frames = findDownloadProgress(transport.sent);
+			assert.deepStrictEqual(frames.map(f => f.phase), [DownloadPhase.Started, DownloadPhase.Progress, DownloadPhase.Completed]);
 			assert.deepStrictEqual(frames.map(f => f.receivedBytes), [0, 500, 1000]);
-			assert.ok(frames.every(f => f.downloadId === 'd1' && f.displayName === 'Claude' && f.totalBytes === 1000));
-			assert.ok(frames.every(f => f.channel === 'ahp-root://'), 'frames are broadcast on the root channel');
+			assert.ok(frames.every(f => f.downloadId === 'd1' && f.kind === 'agent-sdk' && f.resourceId === 'claude' && f.displayName === 'Claude' && f.totalBytes === 1000));
+			assert.ok(frames.every(f => (f as DownloadProgressParams & { channel: string }).channel === 'ahp-root://'), 'frames are broadcast on the root channel');
 		});
 	});
 
