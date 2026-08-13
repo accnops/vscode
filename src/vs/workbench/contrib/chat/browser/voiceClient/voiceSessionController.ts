@@ -1775,6 +1775,13 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 				if (text !== rawText && e.args) {
 					e.args['text'] = text;
 				}
+				if (e.args?.['new_session'] === true) {
+					// Clear the pin first: an explicit "start a new session"
+					// outranks a pin left by a focus change, which would
+					// otherwise win in _sendTranscriptionToChat.
+					this._consumePinnedSubmitSession();
+					this.newSessionAsTarget();
+				}
 				this._statusText.set(VoiceToolDispatchService.getActionLabel(e.name), undefined);
 				this._persistEntry('agent_tool_call', this._renderToolCallSummary(e.name, e.args), {
 					toolName: e.name,
@@ -1821,10 +1828,25 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 					this._statusText.set('Hold to speak...', undefined);
 					this._sendContext();
 				};
+				if (e.name === 'focus_session') {
+					// Like respond_to_session below, the backend acts on this
+					// result: it speaks the outcome of the switch, and only
+					// dispatches work that followed the switch if it landed.
+					this.voiceToolDispatchService.focusSession(e).then(result => {
+						this.logService.trace(`[voice] focus_session ok=${result.ok} reason=${result.reason ?? '<none>'} coding_session_id=${typeof e.args?.['coding_session_id'] === 'string' ? String(e.args['coding_session_id']).slice(-32) : '<none>'}`);
+						this.voiceClientService.sendToolResult(e.callId, result);
+						settle();
+					}, err => {
+						this.logService.error(`[voice] focus_session dispatch failed`, err);
+						this.voiceClientService.sendToolResult(e.callId, { ok: false, reason: 'unsupported' });
+						settle();
+					});
+					return;
+				}
 				if (e.name === 'respond_to_session') {
-					// The one tool whose result the backend acts on: it speaks an
-					// acknowledgement only for an outcome it has observed, so this
-					// must report what actually happened rather than a blanket 'ok'.
+					// The backend speaks an acknowledgement only for an outcome it
+					// has observed, so this must report what actually happened
+					// rather than a blanket 'ok'.
 					const response = e.args?.['response'];
 					const responseType = response && typeof response === 'object' && !Array.isArray(response)
 						? (response as Record<string, unknown>)['type']
@@ -3145,7 +3167,7 @@ export class VoiceSessionController extends Disposable implements IVoiceSessionC
 	 * it stable.
 	 *
 	 *   send_to_chat(text="Open a new terminal and cd into the current directory.")
-	 *   new_sessions(sessions=[{"text": "Refactor upload service"}])
+	 *   send_to_chat(text="Refactor upload service", new_session=true)
 	 *   respond_to_session(...)
 	 */
 	private _renderToolCallSummary(name: string, args: Record<string, unknown> | undefined): string {

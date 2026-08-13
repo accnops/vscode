@@ -63,6 +63,15 @@ export interface IVoiceToolDispatchService {
 	 * have to be distinguishable.
 	 */
 	respondToSession(toolCall: IVoiceToolCall): Promise<IVoiceDispatchResult>;
+
+	/**
+	 * Show the session the backend named.
+	 *
+	 * Structured for the same reason as {@link respondToSession}: the backend
+	 * speaks the outcome of a switch, and when work follows the switch it only
+	 * dispatches that work if the switch landed.
+	 */
+	focusSession(toolCall: IVoiceToolCall): Promise<IVoiceDispatchResult>;
 }
 
 export const IVoiceToolDispatchService = createDecorator<IVoiceToolDispatchService>('voiceToolDispatchService');
@@ -70,7 +79,6 @@ export const IVoiceToolDispatchService = createDecorator<IVoiceToolDispatchServi
 /** Action labels displayed in the status bar during tool execution. */
 const ACTION_LABELS: Record<string, string> = {
 	send_to_chat: localize('agentsVoice.action.sendToChat', "Sending to chat..."),
-	new_sessions: localize('agentsVoice.action.newSessions', "Starting new sessions..."),
 	get_session_info: localize('agentsVoice.action.getSessionInfo', "Checking sessions..."),
 	get_session_changes: localize('agentsVoice.action.getSessionChanges', "Checking changes..."),
 	get_session_thread: localize('agentsVoice.action.getSessionThread', "Checking conversation..."),
@@ -151,53 +159,6 @@ export class VoiceToolDispatchService implements IVoiceToolDispatchService {
 				}
 				break;
 			}
-			case 'new_sessions': {
-				const sessions = args['sessions'];
-				const items: { text?: string }[] = Array.isArray(sessions) ? sessions : [{ text: argString('text') }];
-				let firstResource: URI | undefined;
-				for (const item of items) {
-					const text = item.text;
-					if (text) {
-						const ref = this.chatService.startNewLocalSession(ChatAgentLocation.Chat);
-						const resource = ref.object.sessionResource;
-						if (!firstResource) {
-							firstResource = resource;
-						}
-						await this.chatService.sendRequest(resource, text, this._agentModeOptions);
-						ref.dispose();
-					}
-				}
-				if (firstResource) {
-					delegate.switchToSession(firstResource);
-				}
-				break;
-			}
-			case 'focus_session': {
-				const targetSessionId = argString('coding_session_id');
-				let targetResource: URI | undefined;
-				if (targetSessionId) {
-					// Try agent sessions first
-					const agentSession = this.agentSessionsService.model.sessions
-						.find(s => !s.isArchived() && s.resource.toString() === targetSessionId);
-					targetResource = agentSession?.resource;
-					// Fall back to regular chat sessions
-					if (!targetResource) {
-						for (const chatModel of this.chatService.chatModels.get()) {
-							if (chatModel.sessionResource.toString() === targetSessionId) {
-								targetResource = chatModel.sessionResource;
-								break;
-							}
-						}
-					}
-				}
-				if (targetResource) {
-					const currentResource = await delegate.getCurrentSessionResource();
-					if (targetResource.toString() !== currentResource?.toString()) {
-						delegate.switchToSession(targetResource);
-					}
-				}
-				break;
-			}
 			case 'auto_approve_session': {
 				delegate.addAllAutoApprovedSessions();
 				break;
@@ -228,6 +189,44 @@ export class VoiceToolDispatchService implements IVoiceToolDispatchService {
 			}
 		}
 		return 'ok';
+	}
+
+	/**
+	 * Switch the view to the session the backend named.
+	 *
+	 * An unresolvable id reports `session_not_found` rather than a generic
+	 * failure, because the backend has a distinct phrase for it. A session that
+	 * is already showing counts as success.
+	 */
+	async focusSession(toolCall: IVoiceToolCall): Promise<IVoiceDispatchResult> {
+		const delegate = this._delegate;
+		if (!delegate) {
+			return { ok: false, reason: 'unsupported' };
+		}
+		const rawId = toolCall.args['coding_session_id'];
+		const targetSessionId = typeof rawId === 'string' ? rawId : '';
+		if (!targetSessionId) {
+			return { ok: false, reason: 'session_not_found' };
+		}
+		const agentSession = this.agentSessionsService.model.sessions
+			.find(s => !s.isArchived() && s.resource.toString() === targetSessionId);
+		let targetResource: URI | undefined = agentSession?.resource;
+		if (!targetResource) {
+			for (const chatModel of this.chatService.chatModels.get()) {
+				if (chatModel.sessionResource.toString() === targetSessionId) {
+					targetResource = chatModel.sessionResource;
+					break;
+				}
+			}
+		}
+		if (!targetResource) {
+			return { ok: false, reason: 'session_not_found' };
+		}
+		const currentResource = await delegate.getCurrentSessionResource();
+		if (targetResource.toString() !== currentResource?.toString()) {
+			delegate.switchToSession(targetResource);
+		}
+		return { ok: true };
 	}
 
 	/**

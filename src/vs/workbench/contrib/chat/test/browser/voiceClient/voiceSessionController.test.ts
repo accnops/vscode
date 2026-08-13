@@ -32,7 +32,7 @@ import { IMicCaptureService } from '../../../browser/voiceClient/micCaptureServi
 import { ITtsPlaybackService } from '../../../browser/voiceClient/ttsPlaybackService.js';
 import { IVoiceSessionController, VoiceSessionController } from '../../../browser/voiceClient/voiceSessionController.js';
 import { IVoiceToolDispatchService } from '../../../browser/voiceClient/voiceToolDispatchService.js';
-import { IChatService, IChatToolInvocation } from '../../../common/chatService/chatService.js';
+import { IChatService, IChatToolInvocation, ChatSendResult, IChatModelReference } from '../../../common/chatService/chatService.js';
 import { IPromptsService } from '../../../common/promptSyntax/service/promptsService.js';
 import { derivePendingId, IVoiceAudioResponse, IVoiceBargeIn, IVoiceClientService, IVoiceNarrationSignal, IVoiceSpeechStarted, IVoiceToolCall, IVoiceTranscription, VoiceNarrationKind, IVoiceDispatchResult } from '../../../common/voiceClient/voiceClientService.js';
 import { IChatModel } from '../../../common/model/chatModel.js';
@@ -70,10 +70,10 @@ class TestVoiceClientService extends mock<IVoiceClientService>() {
 	override async connect(): Promise<void> { }
 	override sendSessionContext(): void { }
 	override flushSessionContext(): void { }
-	readonly toolResults: { callId: string; result: string }[] = [];
+	readonly toolResults: { callId: string; result: string | IVoiceDispatchResult }[] = [];
 	private toolResultResolver: (() => void) | undefined;
 	readonly toolResultReceived = new Promise<void>(resolve => this.toolResultResolver = resolve);
-	override sendToolResult(callId: string, result: string): void {
+	override sendToolResult(callId: string, result: string | IVoiceDispatchResult): void {
 		this.toolResults.push({ callId, result });
 		this.toolResultResolver?.();
 	}
@@ -245,6 +245,29 @@ class TestChatService extends mock<IChatService>() {
 }
 
 /**
+ * Chat service that records session creation and sends, so the `new_session`
+ * flag on `send_to_chat` can be checked end to end.
+ */
+class NewSessionChatService extends mock<IChatService>() {
+	override readonly chatModels = observableValue<readonly IChatModel[]>('chatModels', []);
+	readonly created: URI[] = [];
+	readonly sent: { resource: string; message: string }[] = [];
+	override getSession(): undefined { return undefined; }
+	override startNewLocalSession(): IChatModelReference {
+		const resource = URI.parse(`chat-session://new/${this.created.length + 1}`);
+		this.created.push(resource);
+		return { object: { sessionResource: resource }, dispose: () => { } } as unknown as IChatModelReference;
+	}
+	override async acquireOrLoadSession(): Promise<IChatModelReference> {
+		return { object: {}, dispose: () => { } } as unknown as IChatModelReference;
+	}
+	override async sendRequest(resource: URI, message: string): Promise<ChatSendResult> {
+		this.sent.push({ resource: resource.toString(), message });
+		return { kind: 'rejected' } as ChatSendResult;
+	}
+}
+
+/**
  * Chat service whose tracked models can be driven from a test, so the
  * controller's always-on pending-confirmation tracker can be exercised.
  */
@@ -377,6 +400,9 @@ suite('VoiceSessionController', () => {
 			new class extends mock<IVoiceToolDispatchService>() {
 				override setDelegate(): void { }
 				override async respondToSession(): Promise<IVoiceDispatchResult> { return { ok: true }; }
+				// A failure with a reason: forwarding it intact is the contract,
+				// and a bare 'ok' would read as failure on the backend.
+				override async focusSession(): Promise<IVoiceDispatchResult> { return { ok: false, reason: 'session_not_found' }; }
 			}(),
 			new class extends mock<IVoicePlaybackService>() {
 				override notifyPlaybackStart(): void { }
@@ -1263,6 +1289,79 @@ suite('VoiceSessionController', () => {
 		await voiceClientService.toolResultReceived;
 
 		assert.deepStrictEqual(commandService.acceptedInputs, ['send this when listening stops']);
+	});
+
+	test('send_to_chat with new_session routes the text to the freshly created session', async () => {
+		const voiceClientService = new TestVoiceClientService();
+		const commandService = new TestCommandService();
+		const chatService = new NewSessionChatService();
+		const controller = createController(voiceClientService, undefined, commandService, undefined, undefined, undefined, chatService);
+		await controller.connect(mainWindow);
+		(Reflect.get(controller, '_isConnected') as { set(value: boolean, tx: undefined): void }).set(true, undefined);
+
+		voiceClientService.fireToolCall({
+			callId: 'new-session-send',
+			name: 'send_to_chat',
+			args: { text: 'refactor the upload service', new_session: true },
+		});
+		await voiceClientService.toolResultReceived;
+
+		assert.deepStrictEqual({
+			created: chatService.created.length,
+			sent: chatService.sent,
+			acceptedInputs: commandService.acceptedInputs,
+		}, {
+			created: 1,
+			sent: [{ resource: 'chat-session://new/1', message: 'refactor the upload service' }],
+			acceptedInputs: [],
+		});
+	});
+
+	test('send_to_chat with new_session and no text creates and targets a session without sending', async () => {
+		const voiceClientService = new TestVoiceClientService();
+		const commandService = new TestCommandService();
+		const chatService = new NewSessionChatService();
+		const controller = createController(voiceClientService, undefined, commandService, undefined, undefined, undefined, chatService);
+		await controller.connect(mainWindow);
+		(Reflect.get(controller, '_isConnected') as { set(value: boolean, tx: undefined): void }).set(true, undefined);
+
+		voiceClientService.fireToolCall({
+			callId: 'new-session-empty',
+			name: 'send_to_chat',
+			args: { text: '', new_session: true },
+		});
+		await voiceClientService.toolResultReceived;
+
+		const target = (Reflect.get(controller, '_targetSession') as { get(): URI | undefined }).get();
+		assert.deepStrictEqual({
+			created: chatService.created.length,
+			sent: chatService.sent,
+			acceptedInputs: commandService.acceptedInputs,
+			target: target?.toString(),
+		}, {
+			created: 1,
+			sent: [],
+			acceptedInputs: [],
+			target: 'chat-session://new/1',
+		});
+	});
+
+	test('focus_session forwards the structured dispatch result instead of a bare ok', async () => {
+		const voiceClientService = new TestVoiceClientService();
+		const controller = createController(voiceClientService);
+		await controller.connect(mainWindow);
+		(Reflect.get(controller, '_isConnected') as { set(value: boolean, tx: undefined): void }).set(true, undefined);
+
+		voiceClientService.fireToolCall({
+			callId: 'focus-call',
+			name: 'focus_session',
+			args: { session_id: 'missing' },
+		});
+		await voiceClientService.toolResultReceived;
+
+		assert.deepStrictEqual(voiceClientService.toolResults, [
+			{ callId: 'focus-call', result: { ok: false, reason: 'session_not_found' } },
+		]);
 	});
 
 	test('auto-listen is skipped when window does not have focus (multi-window hands-free)', () => {

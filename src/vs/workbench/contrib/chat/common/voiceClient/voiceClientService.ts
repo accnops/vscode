@@ -125,7 +125,7 @@ export type VoiceNarrationKind = 'response' | 'confirmation' | 'question';
  */
 export interface IVoiceDispatchResult {
 	readonly ok: boolean;
-	readonly reason?: 'stale_pending' | 'invalid_answer' | 'no_session' | 'unsupported';
+	readonly reason?: 'stale_pending' | 'invalid_answer' | 'no_session' | 'session_not_found' | 'unsupported';
 }
 
 /**

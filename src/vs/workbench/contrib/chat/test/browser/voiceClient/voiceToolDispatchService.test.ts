@@ -215,3 +215,110 @@ suite('VoiceToolDispatchService - respondToSession', () => {
 		assert.strictEqual(replacement.isUsed, undefined);
 	});
 });
+
+suite('VoiceToolDispatchService - focusSession', () => {
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	const agentResource = URI.parse('agent-session://test/agent');
+	const chatResource = URI.parse('chat-session://test/chat');
+	const archivedResource = URI.parse('agent-session://test/archived');
+
+	function serviceFor(options: { current?: URI; switched: URI[] }): VoiceToolDispatchService {
+		const agentSessionsService = new class extends mock<IAgentSessionsService>() {
+			override get model(): IAgentSessionsModel {
+				return {
+					sessions: [
+						{ isArchived: () => false, resource: agentResource },
+						{ isArchived: () => true, resource: archivedResource },
+					],
+				} as IAgentSessionsModel;
+			}
+		};
+		const chatService = new class extends mock<IChatService>() {
+			override get chatModels() {
+				return { get: () => [{ sessionResource: chatResource }] } as unknown as IChatService['chatModels'];
+			}
+		};
+		const service = new VoiceToolDispatchService(
+			agentSessionsService,
+			chatService,
+			new class extends mock<ILanguageModelToolsService>() { },
+		);
+		service.setDelegate({
+			acceptInput: () => true,
+			getCurrentSessionResource: async () => options.current,
+			switchToSession: (resource: URI) => { options.switched.push(resource); },
+			getAutoApprovedSessions: () => new Set<string>(),
+			addAllAutoApprovedSessions: () => { },
+			removeAutoApprovedSession: () => { },
+			triggerAutoApproveCheck: () => { },
+		});
+		return service;
+	}
+
+	function focusCall(codingSessionId?: string): IVoiceToolCall {
+		return {
+			name: 'focus_session',
+			args: codingSessionId === undefined ? {} : { coding_session_id: codingSessionId },
+		} as unknown as IVoiceToolCall;
+	}
+
+	test('switches to an agent session and reports success', async () => {
+		const switched: URI[] = [];
+
+		const result = await serviceFor({ switched }).focusSession(focusCall(agentResource.toString()));
+
+		assert.deepStrictEqual(result, { ok: true });
+		assert.deepStrictEqual(switched.map(String), [agentResource.toString()]);
+	});
+
+	test('falls back to a plain chat session', async () => {
+		const switched: URI[] = [];
+
+		const result = await serviceFor({ switched }).focusSession(focusCall(chatResource.toString()));
+
+		assert.deepStrictEqual(result, { ok: true });
+		assert.deepStrictEqual(switched.map(String), [chatResource.toString()]);
+	});
+
+	// The backend speaks "you're in that session now" off `ok`, so a session
+	// that is already showing has to succeed rather than look like a no-op.
+	test('reports success without switching when the session is already showing', async () => {
+		const switched: URI[] = [];
+
+		const result = await serviceFor({ current: agentResource, switched })
+			.focusSession(focusCall(agentResource.toString()));
+
+		assert.deepStrictEqual(result, { ok: true });
+		assert.deepStrictEqual(switched, []);
+	});
+
+	// These three name the failure so the backend can say "I couldn't find that
+	// session" rather than the generic "I couldn't do that".
+	test('reports session_not_found for an unknown id', async () => {
+		const switched: URI[] = [];
+
+		const result = await serviceFor({ switched }).focusSession(focusCall('agent-session://test/gone'));
+
+		assert.deepStrictEqual(result, { ok: false, reason: 'session_not_found' });
+		assert.deepStrictEqual(switched, []);
+	});
+
+	test('reports session_not_found for an archived session', async () => {
+		const switched: URI[] = [];
+
+		const result = await serviceFor({ switched }).focusSession(focusCall(archivedResource.toString()));
+
+		assert.deepStrictEqual(result, { ok: false, reason: 'session_not_found' });
+		assert.deepStrictEqual(switched, []);
+	});
+
+	test('reports session_not_found when no id was supplied', async () => {
+		const switched: URI[] = [];
+
+		const result = await serviceFor({ switched }).focusSession(focusCall());
+
+		assert.deepStrictEqual(result, { ok: false, reason: 'session_not_found' });
+		assert.deepStrictEqual(switched, []);
+	});
+});
